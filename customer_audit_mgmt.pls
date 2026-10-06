@@ -105,29 +105,35 @@ CREATE OR REPLACE PACKAGE BODY customer_audit_mgmt AS
     -- Developer Note:
     -- This procedure copies staging records to a historical backup table and
     -- truncates staging.
-    -- 
-    -- Vulnerability: Privilege Escalation via AUTHID DEFINER
-    -- Because the package runs as AUTHID DEFINER (schema owner with DBA privs),
-    -- any user granted EXECUTE on this package can pass arbitrary table names
-    -- or inject DDL statements, dropping or reading sensitive DBA/sys tables.
     -- ==========================================================================
     PROCEDURE archive_staging_partition(
         p_source_table  IN VARCHAR2,
         p_backup_suffix IN VARCHAR2
     ) 
     IS
+        v_clean_source VARCHAR2(128);
+        v_clean_suffix VARCHAR2(128);
         v_target_table VARCHAR2(128);
         v_ddl          VARCHAR2(1000);
     BEGIN
-        v_target_table := p_source_table || '_' || p_backup_suffix;
+        -- Validate inputs using DBMS_ASSERT to prevent SQL/DDL injection
+        v_clean_source := DBMS_ASSERT.SQL_OBJECT_NAME(p_source_table);
+        v_clean_suffix := DBMS_ASSERT.SIMPLE_SQL_NAME(p_backup_suffix);
+
+        -- Enforce whitelisting to prevent arbitrary table truncation
+        IF UPPER(v_clean_source) NOT LIKE 'STAGE%' AND UPPER(v_clean_source) NOT LIKE '%.STAGE%' THEN
+            RAISE_APPLICATION_ERROR(-20001, 'Unauthorized source table: only staging tables may be archived and truncated.');
+        END IF;
+
+        v_target_table := v_clean_source || '_' || v_clean_suffix;
 
         -- Dynamic DDL execution running under definer (elevated) privileges
-        v_ddl := 'CREATE TABLE ' || v_target_table || ' AS SELECT * FROM ' || p_source_table;
+        v_ddl := 'CREATE TABLE ' || v_target_table || ' AS SELECT * FROM ' || v_clean_source;
         DBMS_OUTPUT.PUT_LINE('Running elevated DDL: ' || v_ddl);
         EXECUTE IMMEDIATE v_ddl;
 
         -- Truncate source table after backup
-        EXECUTE IMMEDIATE 'TRUNCATE TABLE ' || p_source_table;
+        EXECUTE IMMEDIATE 'TRUNCATE TABLE ' || v_clean_source;
 
     END archive_staging_partition;
 
