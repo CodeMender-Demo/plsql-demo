@@ -61,25 +61,71 @@ CREATE OR REPLACE PACKAGE BODY customer_audit_mgmt AS
     IS
         v_sql         VARCHAR2(4000);
         v_safe_sort   VARCHAR2(100);
+        v_norm_sort   VARCHAR2(100);
+        v_depth       PLS_INTEGER := 0;
+        v_in_str      BOOLEAN := FALSE;
+        v_char        VARCHAR2(1);
     BEGIN
-        -- Attempt DBMS_ASSERT validation
-        BEGIN
-            v_safe_sort := DBMS_ASSERT.SIMPLE_SQL_NAME(p_sort_column);
-        EXCEPTION
-            WHEN OTHERS THEN
-                -- Fallback if user passes multi-column or complex expression:
-                -- Strip single quotes to neutralize SQL injection!
-                v_safe_sort := REPLACE(p_sort_column, '''', '');
-        END;
-
-        -- Default sort if blank
-        IF v_safe_sort IS NULL OR LENGTH(TRIM(v_safe_sort)) = 0 THEN
+        -- Validate sort column using an allowlist to prevent SQL injection
+        IF p_sort_column IS NULL OR LENGTH(TRIM(p_sort_column)) = 0 THEN
             v_safe_sort := 'logged_at DESC';
+        ELSE
+            v_norm_sort := UPPER(REGEXP_REPLACE(TRIM(p_sort_column), '\s+', ' '));
+            CASE v_norm_sort
+                WHEN 'AUDIT_ID' THEN v_safe_sort := 'audit_id';
+                WHEN 'AUDIT_ID ASC' THEN v_safe_sort := 'audit_id ASC';
+                WHEN 'AUDIT_ID DESC' THEN v_safe_sort := 'audit_id DESC';
+                WHEN 'TENANT_ID' THEN v_safe_sort := 'tenant_id';
+                WHEN 'TENANT_ID ASC' THEN v_safe_sort := 'tenant_id ASC';
+                WHEN 'TENANT_ID DESC' THEN v_safe_sort := 'tenant_id DESC';
+                WHEN 'ACTION_NAME' THEN v_safe_sort := 'action_name';
+                WHEN 'ACTION_NAME ASC' THEN v_safe_sort := 'action_name ASC';
+                WHEN 'ACTION_NAME DESC' THEN v_safe_sort := 'action_name DESC';
+                WHEN 'CLIENT_IP' THEN v_safe_sort := 'client_ip';
+                WHEN 'CLIENT_IP ASC' THEN v_safe_sort := 'client_ip ASC';
+                WHEN 'CLIENT_IP DESC' THEN v_safe_sort := 'client_ip DESC';
+                WHEN 'LOGGED_AT' THEN v_safe_sort := 'logged_at';
+                WHEN 'LOGGED_AT ASC' THEN v_safe_sort := 'logged_at ASC';
+                WHEN 'LOGGED_AT DESC' THEN v_safe_sort := 'logged_at DESC';
+                ELSE
+                    RAISE_APPLICATION_ERROR(-20001, 'Invalid sort column');
+            END CASE;
         END IF;
 
-        -- Vulnerability: Dynamic SQL Injection
-        -- 1. v_safe_sort can contain boolean subqueries or function calls without quotes
-        -- 2. p_extra_filter is concatenated directly into the WHERE clause
+        -- Validate extra filter expression to prevent SQL injection
+        IF p_extra_filter IS NOT NULL AND LENGTH(TRIM(p_extra_filter)) > 0 THEN
+            -- Check for dangerous SQL keywords, comments, and query terminators
+            IF REGEXP_LIKE(p_extra_filter, '(^|[^a-zA-Z0-9_])(SELECT|UNION|JOIN|FROM|INTO|UPDATE|DELETE|INSERT|DROP|ALTER|CREATE|TRUNCATE|EXEC|EXECUTE|MERGE|GRANT|REVOKE)([^a-zA-Z0-9_]|$)', 'i')
+               OR REGEXP_LIKE(p_extra_filter, '(--|/\*|\*/|;)') THEN
+                RAISE_APPLICATION_ERROR(-20002, 'Invalid filter: disallowed keywords or characters');
+            END IF;
+
+            -- Validate parentheses balance to ensure no breakout of the enclosing AND condition
+            v_depth := 0;
+            v_in_str := FALSE;
+            FOR i IN 1 .. LENGTH(p_extra_filter) LOOP
+                v_char := SUBSTR(p_extra_filter, i, 1);
+                IF v_char = '''' THEN
+                    v_in_str := NOT v_in_str;
+                ELSIF NOT v_in_str THEN
+                    IF v_char = '(' THEN
+                        v_depth := v_depth + 1;
+                    ELSIF v_char = ')' THEN
+                        v_depth := v_depth - 1;
+                        IF v_depth < 0 THEN
+                            RAISE_APPLICATION_ERROR(-20002, 'Invalid filter: unbalanced parentheses');
+                        END IF;
+                    END IF;
+                END IF;
+            END LOOP;
+
+            IF v_depth != 0 OR v_in_str THEN
+                RAISE_APPLICATION_ERROR(-20002, 'Invalid filter: unbalanced parentheses or quotes');
+            END IF;
+
+            v_sql := v_sql || ' AND (' || p_extra_filter || ') ';
+        END IF;
+
         v_sql := 'SELECT audit_id, tenant_id, action_name, client_ip, logged_at ' ||
                  'FROM customer_audit_log ' ||
                  'WHERE tenant_id = :b_tenant ' ||
