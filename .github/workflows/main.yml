@@ -1,0 +1,389 @@
+name: CodeMender Scan, Verify, Fix (CRITICAL, HIGH)
+on:
+  # Trigger manually via the GitHub Actions UI
+  workflow_dispatch:
+
+jobs:
+  codemender-scan:
+    runs-on: ubuntu-22.04
+
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
+      security-events: write
+
+    steps:
+      # Checkout the TARGET repository instead of the central .github repo
+      - name: Checkout Target Repository
+        uses: actions/checkout@v4
+
+      # Authenticate to Google Cloud securely
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: "${{ secrets.WIF_PROVIDER }}"
+          service_account: "${{ secrets.WIF_SERVICE_ACCOUNT }}"
+
+      # Set up the gcloud CLI
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      # Download and Install CodeMender On-The-Fly
+      - name: Install CodeMender CLI
+        run: |
+          echo "Downloading CodeMender from Artifact Registry..."
+          gcloud artifacts generic download \
+            --project=cmoc-prod \
+            --location=us \
+            --repository=codemender-cli-production \
+            --package=cm \
+            --version=stable \
+            --name=cm-linux-amd64.zip \
+            --destination=./
+            
+          unzip -q cm-linux-amd64.zip
+          chmod +x cm
+          sudo mv cm /usr/local/bin/cm
+          cm init
+      # Configure Git Identity for the Bot
+      - name: Configure Git Identity
+        run: |
+          git config --global user.name "CodeMender Scan Bot"
+          git config --global user.email "codemender-bot@google.com"
+      # Move the credentials file out of the workspace to protect it from git clean
+      - name: Protect Credentials File
+        run: |
+          mv $GOOGLE_APPLICATION_CREDENTIALS ${{ runner.temp }}/gha-creds.json
+          echo "GOOGLE_APPLICATION_CREDENTIALS=${{ runner.temp }}/gha-creds.json" >> $GITHUB_ENV
+          echo "$GOOGLE_APPLICATION_CREDENTIALS"
+      
+      - name: Update config.yaml with file types
+        shell: python
+        run: |
+          import os
+          import yaml
+    
+          config_file = os.path.expanduser('~/.codemender/config.yaml')
+            
+          # # 1. Discover all unique file extensions, excluding .git
+          # extensions = set()
+          # for root, _, files in os.walk('.'):
+          #     if '.git' in root:
+          #         continue
+          #     for file in files:
+          #         _, ext = os.path.splitext(file)
+          #         if ext:
+          #             extensions.add(ext)
+          # 1. Declare file types to add
+          extensions_list = [
+            ".aspx", 
+            ".cshtml", 
+            ".vbhtml", 
+            ".php", 
+            ".vue", 
+            ".sql", 
+            ".pkh", 
+            ".pkb", 
+            ".tsql", 
+            ".abap",
+            ".acds",
+            ".abdl",
+            ".cls", 
+            ".trigger", 
+            ".ipynb", 
+            ".pl", 
+            ".pm", 
+            ".sh", 
+            ".vb", 
+            ".vbp", 
+            ".frm", 
+            ".bas", 
+            ".cls-meta.xml", 
+            ".pls"
+          ]  
+    
+          # 2. Load existing config
+          if os.path.exists(config_file):
+              with open(config_file, 'r') as f:
+                  config = yaml.safe_load(f) or {}
+          else:
+              print("Config not found")
+              config = {}
+    
+          # Ensure the list key exists (assuming the key is 'file_types')
+          list_key = 'include'
+          if list_key not in config['scan']['extensions'] or config['scan']['extensions'][list_key] is None:
+              config['scan']['extensions'][list_key] = []
+    
+          # 3. Add new extensions
+          updated = False
+          for ext in extensions_list:
+            if ext not in config['scan']['extensions'][list_key]:
+                  config['scan']['extensions'][list_key].append(ext)
+                  updated = True
+    
+          # 4. Write back if changes were made
+          if updated:
+              with open(config_file, 'w') as f:
+                  yaml.dump(config, f, default_flow_style=False)
+              print(f"Updated {config_file} with new extensions:")
+          else:
+              print("No new extensions found.")
+
+      - name: Print config.yaml
+        run: |
+          cat ~/.codemender/config.yaml
+      - name: Find
+        run: |
+            cm find . --deep --deep-workers 16
+            # Write a json report
+            cm report --format json > codemender_report.json
+      - name: Verify Exploitability and Generate Remediation PRs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Filter for OPEN High and Critical vulnerabilities
+          cm report --format=json --status=OPEN \
+            | jq '[.[] | select(.severity | ascii_upcase | IN("CRITICAL", "HIGH"))]' \
+            > high_priority.json
+          COUNT=$(jq length high_priority.json)
+          echo "Identified $COUNT high/critical finding(s)." >> $GITHUB_STEP_SUMMARY
+          if [ "$COUNT" -eq 0 ]; then
+            echo "✅ No critical or high vulnerabilities detected." >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+          # Process top findings: verify with PoC, then fix
+          jq -r '.[] | [.finding_id, .title] | @tsv' high_priority.json | while IFS=$'\t' read -r id title; do
+            echo "::group::Analyzing Finding $id: $title"
+            # 1. Run Verification (Agent generates & runs PoC)
+            cm verify "$id" -y --bypass-warning || true
+  
+            # 2. Query the updated finding status
+            FINDING_STATE=$(cm report "$id" --format=json | jq -r '.[0].status // empty')
+        
+            echo "Post-verification status: $FINDING_STATE"
+  
+            # 3. Branch based on verification outcome
+            if [ "$FINDING_STATE" != "VERIFIED" ]; then
+              # ------------------------------------------------------
+              # SCENARIO A: Vulnerability is NOT exploitable
+              # ------------------------------------------------------
+              echo "### 🛡️ False Positive Filtered: $title" >> $GITHUB_STEP_SUMMARY
+              echo "- **Finding ID**: \`$id\`" >> $GITHUB_STEP_SUMMARY
+              echo "- **Result**: Determined **non-exploitable** by PoC analysis." >> $GITHUB_STEP_SUMMARY
+              echo "- **Action**: Automatically marked as \`DISMISSED\`. No code modifications required." >> $GITHUB_STEP_SUMMARY
+              echo "::notice title=CodeMender Triage::Finding $id was determined not exploitable and dismissed."
+      
+            elif [ "$FINDING_STATE" = "VERIFIED" ]; then
+              # ------------------------------------------------------
+              # SCENARIO B: Vulnerability is CONFIRMED exploitable
+              # ------------------------------------------------------
+              echo "### ⚠️ Confirmed Exploitable: $title" >> $GITHUB_STEP_SUMMARY
+              echo "- **Finding ID**: \`$id\`" >> $GITHUB_STEP_SUMMARY
+              echo "- **Result**: Active PoC exploit succeeded." >> $GITHUB_STEP_SUMMARY
+              echo "- **Action**: Proceeding to automated remediation..." >> $GITHUB_STEP_SUMMARY
+      
+              # 4. FIX: Only attempt remediation for confirmed vulnerabilities
+              if cm fix "$id" -y --bypass-warning && ! git diff --quiet; then
+                # Check Finding Status
+                FINDING_STATE=$(cm report "$id" --format=json | jq -r '.[0].status // empty')
+                if [ "$FINDING_STATE" != "FIXED" ]; then
+                  # ------------------------------------------------------
+                  # SCENARIO A: Vulnerability is NOT fixed
+                  # ------------------------------------------------------
+                  echo "⚠️ Fix could not be automatically applied." >> $GITHUB_STEP_SUMMARY
+                else
+                  echo "Post-fix attempt status: $FINDING_STATE"
+                  BRANCH_NAME="codemender/fix-$id"
+                  git checkout -b "$BRANCH_NAME"
+                  git commit -am "fix(security): remediate verified $title ($id)"
+                  git push origin "$BRANCH_NAME" --force
+        
+                  gh pr create \
+                    --title "🔒 Security Fix: $title" \
+                    --body "CodeMender verified this vulnerability with an active PoC exploit and produced this patch." \
+                    --base main \
+                    --head "$BRANCH_NAME" || true
+                  git checkout main
+                  echo "- **Patch Status**: ✅ Fix generated, verified against PoC, and PR opened." >> $GITHUB_STEP_SUMMARY
+                fi
+              else
+                echo "- **Patch Status**: ⚠️ Fix could not be automatically applied." >> $GITHUB_STEP_SUMMARY
+              fi
+      
+            else
+              echo "Finding $id is in unexpected state: $FINDING_STATE"
+            fi
+      
+            echo "::endgroup::"
+          done
+
+      - name: Export Report Artifacts
+        if: always()
+        run: |
+          cm report --format=html > codemender-audit.html
+          cm report --format=md > codemender-audit.md
+          cm report --format=json > codemender_report.json
+      - name: Upload Audit Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codemender-nightly-reports
+          path: |
+            codemender-audit.html
+            codemender-audit.md
+            codemender_report.json
+      
+      - name: Format SARIF Report for GitHub UI
+        if: always()
+        run: |
+          python3 -c '
+          import json, re, os
+          # GitHub input variable to extract relative path dynamically
+          repo_name = "${{ github.repository }}"
+          repo_short_name = repo_name.split("/")[-1]
+          # Load JSON export
+          with open("codemender_report.json", "r") as f:
+              findings = json.load(f)
+          # Initialilze lists and sets
+          rules = []
+          results = []
+          seen_rules = set()
+      
+          # Map custom severity scales to SARIF levels
+          severity_map = {
+              "CRITICAL": "error",
+              "HIGH": "error",
+              "MEDIUM": "warning",
+              "LOW": "note",
+              "INFO": "note"
+          }
+
+          for finding in findings:
+              # Filter out un-verified findings
+              if finding.get("status") not in ["VERIFIED", "FIXED"]:
+                  continue
+
+              rule_id = finding.get("title", "Unknown-Rule")
+              short_desc = finding.get("title", "Security Finding")
+              analysis = finding.get("analysis", "")
+
+              # Calculate relative_path for location uri
+              file_path = finding.get("file_path", "unknown")
+              relative_path = ""
+              if repo_short_name and repo_short_name in file_path:
+                  relative_path = file_path
+
+                  # Strip absolute runner path strings if present
+                  if "/home/runner/work/" in relative_path:
+                      relative_path = relative_path.split(repo_short_name + "/")[-1]
+                  
+                  # Strip the repo directory prefix if it still remains at the front
+                  if repo_short_name and relative_path.startswith(repo_short_name + "/"):
+                      relative_path = relative_path[len(repo_short_name + "/"):]
+                      
+                  # Clean up any residual formatting problems
+                  relative_path = relative_path.lstrip("/")
+
+              # Populate Rules Array (Ensure each rule ID is unique in the driver definitions)
+              if rule_id not in seen_rules:
+                  rules.append({
+                      "id": rule_id,
+                      "shortDescription": {
+                          "text": short_desc
+                      },
+                      "help": {
+                          "markdown": f"{short_desc}: {analysis}"
+                      }
+                  })
+                  seen_rules.add(rule_id)
+      
+              # Map Severity to SARIF Level
+              raw_severity = finding.get("severity", "MEDIUM").upper()
+              level = severity_map.get(raw_severity, "warning")
+      
+              # Populate Results Array
+              results.append({
+                  "ruleId": rule_id,
+                  "level": level,
+                  "message": {
+                      "text": analysis
+                  },
+                  "locations": [
+                      {
+                          "physicalLocation": {
+                              "artifactLocation": {
+                                  "uri": relative_path,
+                                  "uriBaseId": "%SRCROOT%"
+                              },
+                              "region": {
+                                  "startLine": finding.get("start_line", 1),
+                                  "endLine": finding.get("end_line", 1)
+                              }
+                          }
+                      }
+                  ]
+              })
+
+          # Construct Final SARIF Structure
+          sarif_output = {
+              "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [
+                  {
+                      "tool": {
+                          "driver": {
+                              "name": "CodeMender",
+                              "version": "0.7.0",
+                              "rules": rules
+                          }
+                      },
+                      "results": results
+                  }
+              ]
+          }
+
+          # Save corrected SARIF
+          with open("output.sarif", "w") as f:
+              f.write(json.dumps(sarif_output, indent=2))
+              print(json.dumps(sarif_output, indent=2))'
+
+      
+      # Upload the SARIF payload directly to the target repository using the GitHub CLI
+      - name: Upload SARIF directly via GitHub CLI
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # 1. Compress the SARIF file into GZIP Base64 format as required by the API
+          SARIF_BASE64=$(gzip -c "output.sarif" | base64 -w 0)
+          
+          # 2. Extract the exact commit hash of the checked-out codebase
+          COMMIT_SHA=$(git -C "${TARGET_REPO}" rev-parse HEAD)
+          
+          # 3. Safely resolve the active branch reference name
+          BRANCH_REF=$(git -C "${TARGET_REPO}" symbolic-ref HEAD 2>/dev/null || echo "refs/heads/main")
+          
+          echo "Uploading SARIF payload natively to ${{ github.repository_owner }}/${TARGET_REPO}..."
+          
+          # 4. Execute the secure POST request directly through the GH CLI engine
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "repos/${{ github.repository }}/code-scanning/sarifs" \
+            -f commit_sha="$COMMIT_SHA" \
+            -f ref="$BRANCH_REF" \
+            -f sarif="$SARIF_BASE64" \
+            -f tool_name="CodeMender"
+      
+      # Cleanup Sensitive Binaries (Best Practice)
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f cm-linux-amd64.zip
+          rm -f cm
+          rm -rf .cm_project
+          rm -rf .exploit/
+          rm -f gha-creds-*.json
